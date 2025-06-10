@@ -6,3 +6,6 @@
 	path = lib/xdp-tools
 	url = https://github.com/xdp-project/xdp-tools
 	ignore = dirty
+[submodule "lib/libact"]
+	path = lib/libact
+	url = https://github.com/intel-sandbox/libact/
