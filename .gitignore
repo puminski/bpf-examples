@@ -4,4 +4,5 @@ compile_commands.json
 *.ll
 *.o
 *.skel.h
+*~
 lib/libbpf-install/
