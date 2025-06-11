@@ -139,6 +139,7 @@ static int opt_schprio = SCHED_PRI__DEFAULT;
 static bool opt_tstamp;
 static struct xdp_program *xdp_prog;
 static bool opt_frags;
+static useconds_t opt_cycle = 10000; /* 10 ms */
 
 static bool load_xdp_prog;
 
@@ -1040,6 +1041,7 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 	struct act_cyclic_socket_params act_xsk_params;
 	int ret;
 
+	
 	xsk = calloc(1, sizeof(*xsk));
 	if (!xsk)
 		exit_with_error(errno);
@@ -1071,6 +1073,8 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 	act_xsk_params.frame_size = opt_xsk_frame_size;
 	act_xsk_params.tx = txr;
 	act_xsk_params.comp = &umem->cq;
+	act_xsk_params.cycle = opt_cycle;
+	
 	act_xsk = act_cyclic_socket_configure(xsk->xsk, &act_xsk_params);
 	if (!act_xsk)
 		exit_with_error(-ret);
@@ -1510,7 +1514,6 @@ static void tx_only_all(void)
      int pkt_cnt = 0;
      int i;
      int batch_size = get_batch_size(), idx = 0;
-     useconds_t cycle = 10000; /* 10 ms */
      unsigned long tx_ns = 0;
      struct timespec next;
      int tx_cnt = 0;
@@ -1571,11 +1574,11 @@ static void tx_only_all(void)
      for (i = 0; i < num_socks; i++)
      {
 	  tx_cnt += tx_prepare(xsks[i], &frame_nb[i], batch_size, tx_ns, &idx);
- 	  act_cyclic_socket_start(xsks[i]->act_xsk, idx, batch_size, cycle);
+ 	  act_cyclic_socket_start(xsks[i]->act_xsk, idx, batch_size);
      }
      
      /* Run test with selected cycle  */
-     tx_cyclic_transmission( cycle, batch_size);
+     tx_cyclic_transmission( opt_cycle, batch_size);
 
      /* Close the socket */
      for (i = 0; i < num_socks; i++)
