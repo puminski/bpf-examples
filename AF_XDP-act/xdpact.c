@@ -1037,6 +1037,7 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 	struct xsk_ring_prod *txr;
 	struct act_socket  *act_xsk;
 	struct act_index_table_info *index_table;
+	struct act_cyclic_socket_params act_xsk_params;
 	int ret;
 
 	xsk = calloc(1, sizeof(*xsk));
@@ -1063,9 +1064,14 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 	if (ret)
 		exit_with_error(-ret);
 
-	act_xsk = act_cyclic_socket_configure(xsk->xsk, opt_if, opt_queue,
-					      umem->umem, opt_xsk_frame_size, txr,
-					      &umem->cq);
+	/* Prepare parameters for ACT socket configuration */
+	act_xsk_params.ifname = opt_if;
+	act_xsk_params.queue_id = opt_queue;
+	act_xsk_params.umem = umem->umem;
+	act_xsk_params.frame_size = opt_xsk_frame_size;
+	act_xsk_params.tx = txr;
+	act_xsk_params.comp = &umem->cq;
+	act_xsk = act_cyclic_socket_configure(xsk->xsk, &act_xsk_params);
 	if (!act_xsk)
 		exit_with_error(-ret);
 	index_table = act_index_table_create(act_xsk, get_batch_size());
