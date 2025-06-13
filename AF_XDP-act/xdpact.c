@@ -88,7 +88,7 @@ typedef __u32 u32;
 typedef __u16 u16;
 typedef __u8  u8;
 
-static unsigned long prev_time;
+
 static long tx_cycle_diff_min;
 static long tx_cycle_diff_max;
 static double tx_cycle_diff_ave;
@@ -116,11 +116,9 @@ static struct ether_addr opt_txsmac = {{ 0xec, 0xb1, 0xd7,
 static bool opt_extra_stats;
 static bool opt_quiet;
 static bool opt_app_stats;
-static const char *opt_irq_str = "";
 static u32 irq_no;
 static int irqs_at_init = -1;
 static u32 sequence;
-static int opt_poll;
 static int opt_interval = 10;
 static int opt_retries = 3;
 static u32 opt_xdp_bind_flags = XDP_USE_NEED_WAKEUP;
@@ -131,17 +129,12 @@ static int opt_xsk_frame_size = XSK_UMEM__DEFAULT_FRAME_SIZE;
 static int frames_per_pkt;
 static bool opt_need_wakeup = true;
 static u32 opt_num_xsks = 1;
-static bool opt_busy_poll;
-static clockid_t opt_clock = CLOCK_MONOTONIC;
-static unsigned long opt_tx_cycle_ns;
 static int opt_schpolicy = SCHED_OTHER;
 static int opt_schprio = SCHED_PRI__DEFAULT;
 static bool opt_tstamp;
 static struct xdp_program *xdp_prog;
 static bool opt_frags;
 static useconds_t opt_cycle = 10000; /* 10 ms */
-
-static bool load_xdp_prog;
 
 struct vlan_ethhdr {
 	unsigned char h_dest[6];
@@ -192,12 +185,10 @@ struct xsk_app_stats {
 	unsigned long fill_fail_polls;
 	unsigned long copy_tx_sendtos;
 	unsigned long tx_wakeup_sendtos;
-	unsigned long opt_polls;
 	unsigned long prev_rx_empty_polls;
 	unsigned long prev_fill_fail_polls;
 	unsigned long prev_copy_tx_sendtos;
 	unsigned long prev_tx_wakeup_sendtos;
-	unsigned long prev_opt_polls;
 };
 
 struct xsk_umem_info {
@@ -279,13 +270,6 @@ static int get_schpolicy(int *policy, const char *name)
 	return -1;
 }
 
-static unsigned long get_nsecs(void)
-{
-	struct timespec ts;
-
-	clock_gettime(opt_clock, &ts);
-	return ts.tv_sec * 1000000000UL + ts.tv_nsec;
-}
 
 static void print_benchmark(bool running)
 {
@@ -300,9 +284,6 @@ static void print_benchmark(bool running)
 		printf("xdp-drv ");
 	else
 		printf("	");
-
-	if (opt_poll)
-		printf("poll() ");
 
 	if (running) {
 		printf("running...");
@@ -341,7 +322,7 @@ static void dump_app_stats(long dt)
 	for (i = 0; i < num_socks && xsks[i]; i++) {
 		char *fmt = "%-18s %'-14.0f %'-14lu\n";
 		double rx_empty_polls_ps, fill_fail_polls_ps, copy_tx_sendtos_ps,
-				tx_wakeup_sendtos_ps, opt_polls_ps;
+		     tx_wakeup_sendtos_ps;
 
 		rx_empty_polls_ps = (xsks[i]->app_stats.rx_empty_polls -
 					xsks[i]->app_stats.prev_rx_empty_polls) * 1000000000. / dt;
@@ -352,8 +333,6 @@ static void dump_app_stats(long dt)
 		tx_wakeup_sendtos_ps = (xsks[i]->app_stats.tx_wakeup_sendtos -
 					xsks[i]->app_stats.prev_tx_wakeup_sendtos)
 										* 1000000000. / dt;
-		opt_polls_ps = (xsks[i]->app_stats.opt_polls -
-					xsks[i]->app_stats.prev_opt_polls) * 1000000000. / dt;
 
 		printf("\n%-18s %-14s %-14s\n", "", "calls/s", "count");
 		printf(fmt, "rx empty polls", rx_empty_polls_ps, xsks[i]->app_stats.rx_empty_polls);
@@ -363,255 +342,17 @@ static void dump_app_stats(long dt)
 							xsks[i]->app_stats.copy_tx_sendtos);
 		printf(fmt, "tx wakeup sendtos", tx_wakeup_sendtos_ps,
 							xsks[i]->app_stats.tx_wakeup_sendtos);
-		printf(fmt, "opt polls", opt_polls_ps, xsks[i]->app_stats.opt_polls);
+
 
 		xsks[i]->app_stats.prev_rx_empty_polls = xsks[i]->app_stats.rx_empty_polls;
 		xsks[i]->app_stats.prev_fill_fail_polls = xsks[i]->app_stats.fill_fail_polls;
 		xsks[i]->app_stats.prev_copy_tx_sendtos = xsks[i]->app_stats.copy_tx_sendtos;
 		xsks[i]->app_stats.prev_tx_wakeup_sendtos = xsks[i]->app_stats.tx_wakeup_sendtos;
-		xsks[i]->app_stats.prev_opt_polls = xsks[i]->app_stats.opt_polls;
+
 	}
 
-	if (opt_tx_cycle_ns) {
-		printf("\n%-18s %-10s %-10s %-10s %-10s %-10s\n",
-		       "", "period", "min", "ave", "max", "cycle");
-		printf("%-18s %-10lu %-10lu %-10lu %-10lu %-10lu\n",
-		       "Cyclic TX", opt_tx_cycle_ns, tx_cycle_diff_min,
-		       (long)(tx_cycle_diff_ave / tx_cycle_cnt),
-		       tx_cycle_diff_max, tx_cycle_cnt);
-	}
 }
 
-static bool get_interrupt_number(void)
-{
-	FILE *f_int_proc;
-	char line[4096];
-	bool found = false;
-
-	f_int_proc = fopen("/proc/interrupts", "r");
-	if (f_int_proc == NULL) {
-		printf("Failed to open /proc/interrupts.\n");
-		return found;
-	}
-
-	while (!feof(f_int_proc) && !found) {
-		/* Make sure to read a full line at a time */
-		if (fgets(line, sizeof(line), f_int_proc) == NULL ||
-				line[strlen(line) - 1] != '\n') {
-			printf("Error reading from interrupts file\n");
-			break;
-		}
-
-		/* Extract interrupt number from line */
-		if (strstr(line, opt_irq_str) != NULL) {
-			irq_no = atoi(line);
-			found = true;
-			break;
-		}
-	}
-
-	fclose(f_int_proc);
-
-	return found;
-}
-
-static int get_irqs(void)
-{
-	char count_path[PATH_MAX];
-	int total_intrs = -1;
-	FILE *f_count_proc;
-	char line[4096];
-
-	snprintf(count_path, sizeof(count_path),
-		"/sys/kernel/irq/%i/per_cpu_count", irq_no);
-	f_count_proc = fopen(count_path, "r");
-	if (f_count_proc == NULL) {
-		printf("Failed to open %s\n", count_path);
-		return total_intrs;
-	}
-
-	if (fgets(line, sizeof(line), f_count_proc) == NULL ||
-			line[strlen(line) - 1] != '\n') {
-		printf("Error reading from %s\n", count_path);
-	} else {
-		static const char com[2] = ",";
-		char *token;
-
-		total_intrs = 0;
-		token = strtok(line, com);
-		while (token != NULL) {
-			/* sum up interrupts across all cores */
-			total_intrs += atoi(token);
-			token = strtok(NULL, com);
-		}
-	}
-
-	fclose(f_count_proc);
-
-	return total_intrs;
-}
-
-static void dump_driver_stats(long dt)
-{
-	int i;
-
-	for (i = 0; i < num_socks && xsks[i]; i++) {
-		char *fmt = "%-18s %'-14.0f %'-14lu\n";
-		double intrs_ps;
-		int n_ints = get_irqs();
-
-		if (n_ints < 0) {
-			printf("error getting intr info for intr %i\n", irq_no);
-			return;
-		}
-		xsks[i]->drv_stats.intrs = n_ints - irqs_at_init;
-
-		intrs_ps = (xsks[i]->drv_stats.intrs - xsks[i]->drv_stats.prev_intrs) *
-			 1000000000. / dt;
-
-		printf("\n%-18s %-14s %-14s\n", "", "intrs/s", "count");
-		printf(fmt, "irqs", intrs_ps, xsks[i]->drv_stats.intrs);
-
-		xsks[i]->drv_stats.prev_intrs = xsks[i]->drv_stats.intrs;
-	}
-}
-
-static void dump_stats(void)
-{
-	unsigned long now = get_nsecs();
-	long dt = now - prev_time;
-	int i;
-
-	prev_time = now;
-
-	for (i = 0; i < num_socks && xsks[i]; i++) {
-		char *fmt = "%-18s %'-14.0f %'-14lu\n";
-		double rx_pps, tx_pps, dropped_pps, rx_invalid_pps, full_pps, fill_empty_pps,
-			tx_invalid_pps, tx_empty_pps;
-
-		rx_pps = (xsks[i]->ring_stats.rx_npkts - xsks[i]->ring_stats.prev_rx_npkts) *
-			 1000000000. / dt;
-		tx_pps = (xsks[i]->ring_stats.tx_npkts - xsks[i]->ring_stats.prev_tx_npkts) *
-			 1000000000. / dt;
-
-		printf("\n sock%d@", i);
-		print_benchmark(false);
-		printf("\n");
-
-		if (opt_frags) {
-			u64 rx_frags = xsks[i]->ring_stats.rx_frags;
-			u64 tx_frags = xsks[i]->ring_stats.tx_frags;
-			double rx_fps = (rx_frags - xsks[i]->ring_stats.prev_rx_frags) *
-				1000000000. / dt;
-			double tx_fps = (tx_frags - xsks[i]->ring_stats.prev_tx_frags) *
-				1000000000. / dt;
-			char *ffmt = "%-18s %'-14.0f %'-14lu %'-14.0f %'-14lu\n";
-
-			printf("%-18s %-14s %-14s %-14s %-14s %-14.2f\n", "", "pps", "pkts",
-					"fps", "frags", dt / 1000000000.);
-			printf(ffmt, "rx", rx_pps, xsks[i]->ring_stats.rx_npkts, rx_fps, rx_frags);
-			printf(ffmt, "tx", tx_pps, xsks[i]->ring_stats.tx_npkts, tx_fps, tx_frags);
-			xsks[i]->ring_stats.prev_rx_frags = rx_frags;
-			xsks[i]->ring_stats.prev_tx_frags = tx_frags;
-		} else {
-
-			printf("%-18s %-14s %-14s %-14.2f\n", "", "pps", "pkts",
-					dt / 1000000000.);
-			printf(fmt, "rx", rx_pps, xsks[i]->ring_stats.rx_npkts);
-			printf(fmt, "tx", tx_pps, xsks[i]->ring_stats.tx_npkts);
-		}
-
-		xsks[i]->ring_stats.prev_rx_npkts = xsks[i]->ring_stats.rx_npkts;
-		xsks[i]->ring_stats.prev_tx_npkts = xsks[i]->ring_stats.tx_npkts;
-
-		if (opt_extra_stats) {
-			if (!xsk_get_xdp_stats(xsk_socket__fd(xsks[i]->xsk), xsks[i])) {
-				dropped_pps = (xsks[i]->ring_stats.rx_dropped_npkts -
-						xsks[i]->ring_stats.prev_rx_dropped_npkts) *
-							1000000000. / dt;
-				rx_invalid_pps = (xsks[i]->ring_stats.rx_invalid_npkts -
-						xsks[i]->ring_stats.prev_rx_invalid_npkts) *
-							1000000000. / dt;
-				tx_invalid_pps = (xsks[i]->ring_stats.tx_invalid_npkts -
-						xsks[i]->ring_stats.prev_tx_invalid_npkts) *
-							1000000000. / dt;
-				full_pps = (xsks[i]->ring_stats.rx_full_npkts -
-						xsks[i]->ring_stats.prev_rx_full_npkts) *
-							1000000000. / dt;
-				fill_empty_pps = (xsks[i]->ring_stats.rx_fill_empty_npkts -
-						xsks[i]->ring_stats.prev_rx_fill_empty_npkts) *
-							1000000000. / dt;
-				tx_empty_pps = (xsks[i]->ring_stats.tx_empty_npkts -
-						xsks[i]->ring_stats.prev_tx_empty_npkts) *
-							1000000000. / dt;
-
-				printf(fmt, "rx dropped", dropped_pps,
-				       xsks[i]->ring_stats.rx_dropped_npkts);
-				printf(fmt, "rx invalid", rx_invalid_pps,
-				       xsks[i]->ring_stats.rx_invalid_npkts);
-				printf(fmt, "tx invalid", tx_invalid_pps,
-				       xsks[i]->ring_stats.tx_invalid_npkts);
-				printf(fmt, "rx queue full", full_pps,
-				       xsks[i]->ring_stats.rx_full_npkts);
-				printf(fmt, "fill ring empty", fill_empty_pps,
-				       xsks[i]->ring_stats.rx_fill_empty_npkts);
-				printf(fmt, "tx ring empty", tx_empty_pps,
-				       xsks[i]->ring_stats.tx_empty_npkts);
-
-				xsks[i]->ring_stats.prev_rx_dropped_npkts =
-					xsks[i]->ring_stats.rx_dropped_npkts;
-				xsks[i]->ring_stats.prev_rx_invalid_npkts =
-					xsks[i]->ring_stats.rx_invalid_npkts;
-				xsks[i]->ring_stats.prev_tx_invalid_npkts =
-					xsks[i]->ring_stats.tx_invalid_npkts;
-				xsks[i]->ring_stats.prev_rx_full_npkts =
-					xsks[i]->ring_stats.rx_full_npkts;
-				xsks[i]->ring_stats.prev_rx_fill_empty_npkts =
-					xsks[i]->ring_stats.rx_fill_empty_npkts;
-				xsks[i]->ring_stats.prev_tx_empty_npkts =
-					xsks[i]->ring_stats.tx_empty_npkts;
-			} else {
-				printf("%-15s\n", "Error retrieving extra stats");
-			}
-		}
-	}
-
-	if (opt_app_stats)
-		dump_app_stats(dt);
-	if (irq_no)
-		dump_driver_stats(dt);
-}
-
-static bool is_benchmark_done(void)
-{
-	if (opt_duration > 0) {
-		unsigned long dt = (get_nsecs() - start_time);
-
-		if (dt >= opt_duration)
-			benchmark_done = true;
-	}
-	return benchmark_done;
-}
-
-static void *poller(void *arg)
-{
-	(void)arg;
-	while (!is_benchmark_done()) {
-		sleep(opt_interval);
-		dump_stats();
-	}
-
-	return NULL;
-}
-
-static void remove_xdp_program(void)
-{
-	int err;
-
-	err = xdp_program__detach(xdp_prog, opt_ifindex, opt_attach_mode, 0);
-	if (err)
-		fprintf(stderr, "Could not detach XDP program. Error: %s\n", strerror(-err));
-}
 
 static void int_exit(int sig)
 {
@@ -624,8 +365,6 @@ static void __exit_with_error(int error, const char *file, const char *func,
 	fprintf(stderr, "%s:%s:%i: errno: %d/\"%s\"\n", file, func,
 		line, error, strerror(error));
 
-	if (load_xdp_prog)
-		remove_xdp_program();
 	exit(EXIT_FAILURE);
 }
 
@@ -639,13 +378,10 @@ static void xdpsock_cleanup(void)
 	for (i = 0; i < num_socks; i++) {
 	    xsk_socket__delete(xsks[i]->xsk);
 	}
-	dump_stats();
 
 	(void)xsk_umem__delete(umem);
 
 
-	if (load_xdp_prog)
-		remove_xdp_program();
 }
 
 
@@ -976,6 +712,7 @@ static void gen_eth_frame(struct xsk_umem_info *umem, u64 addr)
 }
 
 
+/* Fill the packet payload in <frame>  in UMEM using <val> */
 static void modify_eth_frame(struct xsk_socket_info *xsk, int frame, u32 val)
 {
      u8  *buffer, *payload;
@@ -986,11 +723,6 @@ static void modify_eth_frame(struct xsk_socket_info *xsk, int frame, u32 val)
      payload = buffer + PKT_HDR_SIZE;
      memset32_htonl(payload, val,
 		       UDP_PKT_DATA_SIZE);
-#if 0
-
-     num = ntohl(*(u32 *)payload);
-     *(u32 *)payload = htonl(num+1);
-#endif
      
 }
 
@@ -1049,10 +781,7 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 	xsk->umem = umem;
 	cfg.rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS;
 	cfg.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
-	if (load_xdp_prog )
-		cfg.libxdp_flags = XSK_LIBXDP_FLAGS__INHIBIT_PROG_LOAD;
-	else
-		cfg.libxdp_flags = 0;
+	cfg.libxdp_flags = 0;
 	if (opt_attach_mode == XDP_MODE_SKB)
 		cfg.xdp_flags = XDP_FLAGS_SKB_MODE;
 	else
@@ -1088,12 +817,12 @@ static struct xsk_socket_info *xsk_configure_socket(struct xsk_umem_info *umem,
 	xsk->app_stats.fill_fail_polls = 0;
 	xsk->app_stats.copy_tx_sendtos = 0;
 	xsk->app_stats.tx_wakeup_sendtos = 0;
-	xsk->app_stats.opt_polls = 0;
+
 	xsk->app_stats.prev_rx_empty_polls = 0;
 	xsk->app_stats.prev_fill_fail_polls = 0;
 	xsk->app_stats.prev_copy_tx_sendtos = 0;
 	xsk->app_stats.prev_tx_wakeup_sendtos = 0;
-	xsk->app_stats.prev_opt_polls = 0;
+
 
 	return xsk;
 }
@@ -1104,7 +833,6 @@ static struct option long_options[] = {
 	{"l2fwd", no_argument, 0, 'l'},
 	{"interface", required_argument, 0, 'i'},
 	{"queue", required_argument, 0, 'q'},
-	{"poll", no_argument, 0, 'p'},
 	{"xdp-skb", no_argument, 0, 'S'},
 	{"xdp-native", no_argument, 0, 'N'},
 	{"interval", required_argument, 0, 'n'},
@@ -1146,7 +874,6 @@ static void usage(const char *prog)
 		"  Options:\n"
 		"  -i, --interface=n	Run on interface n\n"
 		"  -q, --queue=n	Use queue n (default 0)\n"
-		"  -p, --poll		Use poll syscall\n"
 		"  -S, --xdp-skb=n	Use XDP skb-mod\n"
 		"  -N, --xdp-native=n	Enforce XDP native mode\n"
 		"  -n, --interval=n	Specify statistics update interval (default 1 sec).\n"
@@ -1159,7 +886,6 @@ static void usage(const char *prog)
 		"  -M, --shared-umem	Enable XDP_SHARED_UMEM (cannot be used with -R)\n"
 		"  -d, --duration=n	Duration in secs to run command.\n"
 		"			Default: forever.\n"
-		"  -w, --clock=CLOCK	Clock NAME (default MONOTONIC).\n"
 		"  -b, --batch-size=n	Batch size for sending or receiving\n"
 		"			packets. Default: %d\n"
 		"  -C, --tx-pkt-count=n	Number of packets to send.\n"
@@ -1201,7 +927,7 @@ static void parse_command_line(int argc, char **argv)
 
 	for (;;) {
 		c = getopt_long(argc, argv,
-				"rtli:q:pSNn:w:O:czf:muMd:b:C:s:P:VJ:K:G:H:T:yW:U:xQaI:BRF",
+				"rtli:q:SNn:O:czf:muMd:b:C:s:P:VJ:K:G:H:T:yW:U:xQaRF",
 				long_options, &option_index);
 		if (c == -1)
 			break;
@@ -1213,9 +939,6 @@ static void parse_command_line(int argc, char **argv)
 		case 'q':
 			opt_queue = atoi(optarg);
 			break;
-		case 'p':
-			opt_poll = 1;
-			break;
 		case 'S':
 			opt_attach_mode = XDP_MODE_SKB;
 			opt_xdp_bind_flags |= XDP_COPY;
@@ -1225,14 +948,6 @@ static void parse_command_line(int argc, char **argv)
 			break;
 		case 'n':
 			opt_interval = atoi(optarg);
-			break;
-		case 'w':
-			if (get_clockid(&opt_clock, optarg)) {
-				fprintf(stderr,
-					"ERROR: Invalid clock %s. Default to CLOCK_MONOTONIC.\n",
-					optarg);
-				opt_clock = CLOCK_MONOTONIC;
-			}
 			break;
 		case 'O':
 			opt_retries = atoi(optarg);
@@ -1306,10 +1021,6 @@ static void parse_command_line(int argc, char **argv)
 				usage(basename(argv[0]));
 			}
 			break;
-		case 'T':
-			opt_tx_cycle_ns = atoi(optarg);
-			opt_tx_cycle_ns *= NSEC_PER_USEC;
-			break;
 		case 'y':
 			opt_tstamp = 1;
 			break;
@@ -1333,18 +1044,6 @@ static void parse_command_line(int argc, char **argv)
 		case 'a':
 			opt_app_stats = 1;
 			break;
-		case 'I':
-			opt_irq_str = optarg;
-			if (get_interrupt_number())
-				irqs_at_init = get_irqs();
-			if (irqs_at_init < 0) {
-				fprintf(stderr, "ERROR: Failed to get irqs for %s\n", opt_irq_str);
-				usage(basename(argv[0]));
-			}
-			break;
-		case 'B':
-			opt_busy_poll = 1;
-			break;
 		case 'F':
 			opt_frags = true;
 			break;
@@ -1367,7 +1066,7 @@ static void parse_command_line(int argc, char **argv)
 		usage(basename(argv[0]));
 	}
 
-	load_xdp_prog = (opt_num_xsks > 1 || opt_frags);
+
 	if (opt_frags)
 		opt_xdp_bind_flags |= XDP_USE_SG;
 }
@@ -1465,42 +1164,27 @@ static int tx_prepare(struct xsk_socket_info *xsk, u32 *frame_nb,
 }
 
 
-#if 0
-static void complete_tx_only_all(void)
-{
-	bool pending;
-	int i;
-
-	do {
-		pending = false;
-		for (i = 0; i < num_socks; i++) {
-			if (xsks[i]->outstanding_tx) {
-				complete_tx_only(xsks[i], opt_batch_size);
-				pending = !!xsks[i]->outstanding_tx;
-			}
-		}
-		sleep(1);
-	} while (pending && opt_retries-- > 0);
-}
-
-#endif
-
+/* Mimic cyclic transmission */
 static void tx_cyclic_transmission( useconds_t cycle_time, int batch_size)
 {
      int cycle_no, i, j,  buffer_no, frame_no;
      struct act_index_table_info *index_table;
      for (cycle_no = 0; cycle_no < opt_interval; cycle_no++)
      {
+	  printf("Staring cycle_no = %d\n", cycle_no);
 	  for (i = 0; i < num_socks; i++)
-	  {
+	  {       
 	       index_table = xsks[i]->index_table;
+	       /* Use 2 buffers per stream */
 	       buffer_no = cycle_no % 2;
 	       for (j = 0; j < batch_size; j++)
 	       {
 		    frame_no =  2* j + buffer_no;
-		    printf("cycle_no = %d, j = %d, buffer_no = %d\n", cycle_no, j, buffer_no);
+		    printf("Packet %d, buffer_no = %d, frame_no %d\n", j, buffer_no, frame_no);
 		    modify_eth_frame(xsks[i], frame_no, frame_no);
 		    act_ring_prod_update_index(index_table,j, buffer_no);
+		    if (benchmark_done)
+			 return;
 	       }
 	  }
 	  usleep( cycle_time);
@@ -1511,7 +1195,6 @@ static void tx_only_all(void)
 {
      u32 frame_nb[MAX_SOCKS] = {};
      unsigned long next_tx_ns = 0;
-     int pkt_cnt = 0;
      int i;
      int batch_size = get_batch_size(), idx = 0;
      unsigned long tx_ns = 0;
@@ -1519,56 +1202,6 @@ static void tx_only_all(void)
      int tx_cnt = 0;
      long diff;
      int err;
-
-
-
-     if (opt_poll && opt_tx_cycle_ns) {
-	  fprintf(stderr,
-		  "Error: --poll and --tx-cycles are both set\n");
-	  return;
-     }
-
-
-     if (opt_tx_cycle_ns) {
-	  /* Align Tx time to micro-second boundary */
-	  next_tx_ns = (get_nsecs() / NSEC_PER_USEC + 1) *
-	       NSEC_PER_USEC;
-	  next_tx_ns += opt_tx_cycle_ns;
-
-	  /* Initialize periodic Tx scheduling variance */
-	  tx_cycle_diff_min = 1000000000;
-	  tx_cycle_diff_max = 0;
-	  tx_cycle_diff_ave = 0.0;
-     }
-
-
-
-     if (opt_tx_cycle_ns) {
-	  next.tv_sec = next_tx_ns / NSEC_PER_SEC;
-	  next.tv_nsec = next_tx_ns % NSEC_PER_SEC;
-	  err = clock_nanosleep(opt_clock, TIMER_ABSTIME, &next, NULL);
-	  if (err) {
-	       if (err != EINTR)
-		    fprintf(stderr,
-			    "clock_nanosleep failed. Err:%d errno:%d\n",
-			    err, errno);
-	       return;
-	  }
-
-	  /* Measure periodic Tx scheduling variance */
-	  tx_ns = get_nsecs();
-	  diff = tx_ns - next_tx_ns;
-	  if (diff < tx_cycle_diff_min)
-	       tx_cycle_diff_min = diff;
-
-	  if (diff > tx_cycle_diff_max)
-	       tx_cycle_diff_max = diff;
-
-	  tx_cycle_diff_ave += (double)diff;
-	  tx_cycle_cnt++;
-     } else if (opt_tstamp) {
-	  tx_ns = get_nsecs();
-     }
 
      /* Start transmission */
      for (i = 0; i < num_socks; i++)
@@ -1587,44 +1220,7 @@ static void tx_only_all(void)
      }
 
 
-     pkt_cnt += tx_cnt;
-     if (opt_tx_cycle_ns)
-	  next_tx_ns += opt_tx_cycle_ns;
-#if 0
-     if (opt_pkt_count)
-	  complete_tx_only_all();
-#endif
 	
-}
-
-
-
-static void load_xdp_program(void)
-{
-	char errmsg[STRERR_BUFSIZE];
-	int err;
-
-	xdp_prog = xdp_program__open_file("xdpsock_kern.o", NULL, NULL);
-	err = libxdp_get_error(xdp_prog);
-	if (err) {
-		libxdp_strerror(err, errmsg, sizeof(errmsg));
-		fprintf(stderr, "ERROR: program loading failed: %s\n", errmsg);
-		exit(EXIT_FAILURE);
-	}
-
-	err = xdp_program__set_xdp_frags_support(xdp_prog, opt_frags);
-	if (err) {
-		libxdp_strerror(err, errmsg, sizeof(errmsg));
-		fprintf(stderr, "ERROR: Enable frags support failed: %s\n", errmsg);
-		exit(EXIT_FAILURE);
-	}
-
-	err = xdp_program__attach(xdp_prog, opt_ifindex, opt_attach_mode, 0);
-	if (err) {
-		libxdp_strerror(err, errmsg, sizeof(errmsg));
-		fprintf(stderr, "ERROR: attaching program failed: %s\n", errmsg);
-		exit(EXIT_FAILURE);
-	}
 }
 
 
@@ -1632,9 +1228,6 @@ static void load_xdp_program(void)
 static void apply_setsockopt(struct xsk_socket_info *xsk)
 {
 	int sock_opt;
-
-	if (!opt_busy_poll)
-		return;
 
 	sock_opt = 1;
 	if (setsockopt(xsk_socket__fd(xsk->xsk), SOL_SOCKET, SO_PREFER_BUSY_POLL,
@@ -1652,32 +1245,24 @@ static void apply_setsockopt(struct xsk_socket_info *xsk)
 		exit_with_error(errno);
 }
 
-
-
 int main(int argc, char **argv)
 {
 	struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
 	bool rx = false, tx = false;
 	struct sched_param schparam;
 	struct xsk_umem_info *umem;
-	pthread_t pt;
 	int i, ret;
 	void *bufs;
 
 	parse_command_line(argc, argv);
 	opt_quiet = 1;
 
-#if 1
-	  //	UMA: memory limit
-		if (setrlimit(RLIMIT_MEMLOCK, &r)) {
-			fprintf(stderr, "ERROR: setrlimit(RLIMIT_MEMLOCK) \"%s\"\n",
-				strerror(errno));
-			exit(EXIT_FAILURE);
-		}
+	if (setrlimit(RLIMIT_MEMLOCK, &r)) {
+	     fprintf(stderr, "ERROR: setrlimit(RLIMIT_MEMLOCK) \"%s\"\n",
+		     strerror(errno));
+	     exit(EXIT_FAILURE);
+	}
 
-		if (load_xdp_prog)
-			load_xdp_program();
-#endif
 
 	/* Reserve memory for the umem. Use hugepages if unaligned chunk mode */
 	bufs = mmap(NULL, NUM_FRAMES * opt_xsk_frame_size,
@@ -1718,14 +1303,6 @@ int main(int argc, char **argv)
 
 	setlocale(LC_ALL, "");
 
-	prev_time = get_nsecs();
-	start_time = prev_time;
-
-	if (!opt_quiet) {
-		ret = pthread_create(&pt, NULL, poller, NULL);
-		if (ret)
-			exit_with_error(ret);
-	}
 
 	/* Configure sched priority for better wake-up accuracy */
 	memset(&schparam, 0, sizeof(schparam));
@@ -1741,9 +1318,6 @@ int main(int argc, char **argv)
 
 out:
 	benchmark_done = true;
-
-	if (!opt_quiet)
-		pthread_join(pt, NULL);
 
 	xdpsock_cleanup();
 
