@@ -3,4 +3,12 @@
 This is a sample application for ACT Library. It is based on
 AF_XDP sockets example application.
 
+Example
+Following example transmits 50 cycles ("-n 50"), each of them with 10 packets ("-C 10"),
+using  ens21f0np0 interface (-i ens21f0np0).
+On my machine it should run with root priviledge ("sudo")
+
+#+BEGIN_SRC sh
+  sudo ./xdpact -i ens21f0np0 -C 10 -n 50
+#+END_SRC
 
